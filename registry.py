@@ -1,0 +1,86 @@
+"""EDEN lobby directory. No relay, UPnP, public-IP lookup or remote administration.
+Run locally: python registry.py --local-test. Production requires TLS cert/key.
+Room leases expire after 60s. All state is ephemeral; never log tokens/endpoints.
+"""
+import argparse, collections, hmac, http.server, ipaddress, json, re, secrets, ssl, threading, time
+class Directory:
+ def __init__(self): self.rooms={}; self.rates={}; self.lock=threading.Lock()
+ def handle(self,method,path,data,auth,peer):
+  with self.lock:
+   now=time.monotonic(); self.rooms={k:r for k,r in self.rooms.items() if r['expiry']>now}
+   self.rates={k:v for k,v in self.rates.items() if now-v[0]<60}
+   count=self.rates.setdefault(peer,[now,0]);count[1]+=1
+   if count[1]>180 or len(self.rates)>10000:return 429,{'error':'Rate limited; retry later'}
+   if method=='GET' and path=='/v1/rooms':return 200,{'rooms':[self.public(r) for r in self.rooms.values() if r['public']][:100]}
+   if method=='POST' and path=='/v1/rooms':
+    if len(self.rooms)>=200:return 503,{'error':'Directory capacity reached'}
+    endpoint=data.get('endpoint','')
+    if not isinstance(endpoint,str):return 400,{'error':'Invalid endpoint'}
+    host,sep,port=endpoint.rpartition(':')
+    if not sep or not port.isascii() or not port.isdigit() or not 1024<=int(port)<=65535:return 400,{'error':'Invalid endpoint port'}
+    try:
+     ip=ipaddress.IPv4Address(host)
+     if ip.is_multicast or ip.is_unspecified:raise ValueError()
+    except ValueError:
+     if re.fullmatch(r'[0-9.]+',host):return 400,{'error':'Invalid IPv4'}
+     if len(host)>253 or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?',host) or any(not 1<=len(x)<=63 or x.startswith('-') or x.endswith('-') for x in host.split('.')):return 400,{'error':'Invalid endpoint host'}
+    if type(data.get('public')) is not bool or data.get('map') not in ['BioLab','Biocore','Forge','Frostline'] or data.get('mode') not in [0,1,2]:return 400,{'error':'Invalid room settings'}
+    name=data.get('name','')
+    if not isinstance(name,str) or not 1<=len(name.strip())<=40 or any(ord(c)<32 for c in name):return 400,{'error':'Invalid room name'}
+    r=dict(id=secrets.token_hex(16),name=name.strip(),public=data['public'],map=data['map'],mode=data['mode'],players=1,endpoint=endpoint,owner=secrets.token_hex(32),code=secrets.token_hex(16),expiry=now+60,tickets={})
+    self.rooms[r['id']]=r;return 201,dict(id=r['id'],ownerToken=r['owner'],inviteCode=r['code'])
+   if method=='POST' and path=='/v1/join':
+    r=None;code=data.get('code','');rid=data.get('roomId','')
+    if code:
+     for room in self.rooms.values():
+      if isinstance(code,str) and hmac.compare_digest(room['code'],code):r=room;break
+    elif rid in self.rooms and self.rooms[rid]['public']:r=self.rooms[rid]
+    if not r:return 404,{'error':'Room not found, expired or invitation invalid'}
+    if r['players']>=8:return 409,{'error':'Room full (8 players)'}
+    r['tickets']={k:v for k,v in r['tickets'].items() if v>now}
+    if len(r['tickets'])>=64:return 429,{'error':'Too many pending joins'}
+    ticket=secrets.token_hex(32);r['tickets'][ticket]=now+30
+    return 200,dict(endpoint=r['endpoint'],ticket=ticket,roomId=r['id'])
+   match=re.fullmatch(r'/v1/rooms/([a-f0-9]{32})(/verify)?',path)
+   if not match or match[1] not in self.rooms:return 404,{'error':'Room closed or expired'}
+   r=self.rooms[match[1]]
+   if not hmac.compare_digest('Bearer '+r['owner'],auth):return 403,{'error':'Host authorization required'}
+   if method=='POST' and match[2]:
+    ticket=data.get('ticket','');deadline=r['tickets'].pop(ticket,0) if isinstance(ticket,str) else 0
+    return (200,{'ok':True}) if deadline>now else (403,{'error':'Invitation ticket invalid, expired or already used'})
+   if method=='DELETE':del self.rooms[r['id']];return 200,{'ok':True}
+   if method=='PATCH':
+    if type(data.get('players')) is not int or not 0<=data['players']<=8 or data.get('map') not in ['BioLab','Biocore','Forge','Frostline'] or data.get('mode') not in [0,1,2]:return 400,{'error':'Invalid heartbeat'}
+    r.update(players=data['players'],map=data['map'],mode=data['mode'],expiry=now+60);return 200,{'ok':True}
+   return 405,{'error':'Method not allowed'}
+ @staticmethod
+ def public(r):return {k:r[k] for k in ['id','name','map','mode','players']}
+class Handler(http.server.BaseHTTPRequestHandler):
+ directory=Directory()
+ def log_message(self,*args):pass
+ def do_GET(self):self.dispatch()
+ def do_POST(self):self.dispatch()
+ def do_PATCH(self):self.dispatch()
+ def do_DELETE(self):self.dispatch()
+ def dispatch(self):
+  self.connection.settimeout(5)
+  try:
+   n=int(self.headers.get('Content-Length','0'))
+   if n<0 or n>4096:raise ValueError()
+   data=json.loads(self.rfile.read(n)) if n else {}
+   if not isinstance(data,dict):raise ValueError()
+   status,body=self.directory.handle(self.command,self.path,data,self.headers.get('Authorization',''),self.client_address[0])
+  except (ValueError,TypeError,UnicodeError):status,body=400,{'error':'Invalid request'}
+  except (TimeoutError,ConnectionError):return
+  except Exception:status,body=500,{'error':'Directory request failed'}
+  raw=json.dumps(body,ensure_ascii=True).encode();self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Cache-Control','no-store');self.send_header('Content-Length',str(len(raw)));self.end_headers()
+  try:self.wfile.write(raw)
+  except (ConnectionError,TimeoutError):pass
+if __name__=='__main__':
+ a=argparse.ArgumentParser();a.add_argument('--local-test',action='store_true');a.add_argument('--bind',default='127.0.0.1');a.add_argument('--port',type=int,default=8787);a.add_argument('--cert');a.add_argument('--key');o=a.parse_args()
+ if o.local_test and o.bind!='127.0.0.1':a.error('Local test must bind loopback only')
+ if not o.local_test and not (o.cert and o.key):a.error('Production requires HTTPS cert/key; deployment needs user approval')
+ server=http.server.ThreadingHTTPServer((o.bind,o.port),Handler)
+ if not o.local_test:
+  context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);context.minimum_version=ssl.TLSVersion.TLSv1_2;context.load_cert_chain(o.cert,o.key);server.socket=context.wrap_socket(server.socket,server_side=True)
+ print('EDEN lobby directory ready; no access/endpoint logs',flush=True);server.serve_forever()

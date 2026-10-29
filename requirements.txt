@@ -1,1 +1,2 @@
 uvicorn>=0.34,<1
+psycopg[binary]==3.3.6

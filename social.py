@@ -61,19 +61,32 @@ class SocialStore:
         for r in self.reservations.values():
             if r['party']==party and r['state']=='preparing':r['state']='cancelled'
     def snapshot(self,actor):
-        friends=[]
-        for player in self.storage.friends(actor):friends.append(self.profile(player))
-        requests=[]
-        for row in self.storage.requests(actor):
-            value=self.profile(row['b'] if row['a']==actor else row['a']);value['direction']='outgoing' if row['a']==actor else 'incoming';requests.append(value)
-        invitations=[dict(id=k,**{'from':self.profile(v['from'])},party=v['party'],expiresIn=max(0,int(v['until']-time.monotonic()))) for k,v in self.invites.items() if v['to']==actor]
+        friend_ids,request_rows=self.storage.relations(actor)
+        invite_rows=[(k,v) for k,v in self.invites.items() if v['to']==actor]
         party=self.party_for(actor)
-        public=None if not party else dict(id=party['id'],leader=party['leader'],members=[dict(**self.profile(m),ready=ready) for m,ready in party['members'].items()])
+        ids={actor,*friend_ids}
+        ids.update(row['b'] if row['a']==actor else row['a'] for row in request_rows)
+        ids.update(v['from'] for _,v in invite_rows)
+        if party:ids.update(party['members'])
+        # Request-scoped batch only: no stale relationship/authentication cache.
+        profiles=self.storage.profiles(ids)
+        def view(player):
+            row=profiles.get(player)
+            if not row:return None
+            status,seen=self.presence.get(player,('offline',0))
+            if time.monotonic()-seen>35:status='offline'
+            return dict(id=row['id'],name=row['name'],status=status)
+        friends=[view(player) for player in friend_ids]
+        requests=[]
+        for row in request_rows:
+            value=view(row['b'] if row['a']==actor else row['a']);value['direction']='outgoing' if row['a']==actor else 'incoming';requests.append(value)
+        invitations=[dict(id=k,**{'from':view(v['from'])},party=v['party'],expiresIn=max(0,int(v['until']-time.monotonic()))) for k,v in invite_rows]
+        public=None if not party else dict(id=party['id'],leader=party['leader'],members=[dict(**view(m),ready=ready) for m,ready in party['members'].items()])
         admission=None
         for r in reversed(list(self.reservations.values())):
             if actor in r['tickets'] or actor==r.get('resident'):
                 admission=dict(reservation=r['id'],reservationId=r['id'],roomId=r['room'],endpoint=r['endpoint'],ticket=r['tickets'].get(actor,''),resident=actor==r.get('resident'),team=r['team'],state=r['state'],expiresIn=max(0,int(r['until']-time.monotonic())));break
-        return dict(self=self.profile(actor),friends=friends,requests=requests,invitations=invitations,party=public,admission=admission)
+        return dict(self=view(actor),friends=friends,requests=requests,invitations=invitations,party=public,admission=admission)
     def room_reservations(self,room):
         return [r for r in self.reservations.values() if r['room']==room and r['state'] in ('preparing','committed')]
     def reservation_ticket(self,room,ticket):

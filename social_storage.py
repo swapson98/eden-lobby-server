@@ -5,6 +5,8 @@ One lobby worker remains required: invitations and UDP admission leases are tran
 """
 from contextlib import contextmanager
 import sqlite3
+import hashlib
+import threading
 
 
 class StorageUnavailable(Exception):
@@ -32,6 +34,12 @@ class SQLiteStorage:
     def profile(self, player):
         row = self.db.execute('SELECT id,name FROM players WHERE id=?', (player,)).fetchone()
         return dict(row) if row else None
+    def profiles(self, players):
+        ids=list(set(players))
+        if not ids:return {}
+        query='SELECT id,name FROM players WHERE id IN ('+','.join('?' for _ in ids)+')'
+        return {row['id']:dict(row) for row in self.db.execute(query,ids)}
+    def relations(self, player):return self.friends(player),self.requests(player)
     def register(self, player, name, digest):
         self.db.execute('INSERT INTO players VALUES(?,?,?)', (player, name, digest))
     def friends(self, player):
@@ -60,51 +68,80 @@ class PostgresStorage:
         # Read the secret only when connecting; do not retain it in object reprs.
         self.db = None
         self.allow_local_test = allow_local_test
+        self._connection = None
+        self._dsn_key = None
+        self._transaction_lock = threading.RLock()
+
+    def _discard_connection(self):
+        if self._connection is not None:
+            self._connection.close()
+        self._connection = None
+        self._dsn_key = None
 
     def close(self):
-        if self.db is not None: self.db.close()
+        with self._transaction_lock:self._discard_connection()
 
     @contextmanager
     def transaction(self):
         import os
-        try:
-            import psycopg
-            from psycopg.rows import dict_row
-            from psycopg.conninfo import conninfo_to_dict
-            dsn = os.environ.get('EDEN_SOCIAL_DATABASE_URL', '')
-            options = conninfo_to_dict(dsn)
-            local_test = self.allow_local_test and options.get('host') == '127.0.0.1'
-            if not options.get('host') or (not local_test and options.get('sslmode') not in ('require', 'verify-ca', 'verify-full')):
-                raise StorageUnavailable()
-            with psycopg.connect(dsn, connect_timeout=3, autocommit=True,
-                                 prepare_threshold=None, row_factory=dict_row) as conn:
-                self.db = conn
+        # The directory serializes social writes. Keep a single bounded connection,
+        # and guard direct storage callers too. Never replay a failed transaction.
+        with self._transaction_lock:
+            try:
+                import psycopg
+                from psycopg.rows import dict_row
+                from psycopg.conninfo import conninfo_to_dict
+                dsn = os.environ.get('EDEN_SOCIAL_DATABASE_URL', '')
+                options = conninfo_to_dict(dsn)
+                local_test = self.allow_local_test and options.get('host') == '127.0.0.1'
+                if not options.get('host') or (not local_test and options.get('sslmode') not in ('require', 'verify-ca', 'verify-full')):
+                    raise StorageUnavailable()
+                key=hashlib.sha256(dsn.encode()).digest()
+                if self._connection is not None and (self._dsn_key!=key or self._connection.closed or self._connection.broken):
+                    self._discard_connection()
+                if self._connection is None:
+                    self._connection=psycopg.connect(dsn, connect_timeout=3, autocommit=True,
+                                                     prepare_threshold=None, row_factory=dict_row)
+                    self._dsn_key=key
+                conn=self._connection
+                self.db=conn
                 with conn.transaction():
-                    # Transaction-local settings also work through Supavisor;
-                    # avoid provider-specific startup options/session leakage.
                     conn.execute("SELECT set_config('statement_timeout','3000',true), "
                                  "set_config('lock_timeout','1000',true), "
                                  "set_config('idle_in_transaction_session_timeout','10000',true)")
-                    # Serialize party/friend transitions across DB connections.
-                    # Short lock timeout avoids queuing indefinitely. No write retry.
                     conn.execute('SELECT pg_advisory_xact_lock(1162102094)')
                     yield self
-        except StorageUnavailable:
-            raise
-        except (ImportError, OSError):
-            raise StorageUnavailable() from None
-        except Exception as exc:
-            if 'psycopg' in locals() and isinstance(exc, psycopg.Error):
+            except StorageUnavailable:
+                self._discard_connection()
+                raise
+            except (ImportError, OSError):
+                self._discard_connection()
                 raise StorageUnavailable() from None
-            raise
-        finally:
-            self.db = None
+            except Exception as exc:
+                if 'psycopg' in locals() and isinstance(exc, psycopg.Error):
+                    self._discard_connection()
+                    raise StorageUnavailable() from None
+                raise
+            finally:
+                self.db=None
 
     def actor(self, digest):
         row = self.db.execute('SELECT player_id AS id FROM eden_social.profiles WHERE credential_hash=%s', (digest,)).fetchone()
         return row['id'] if row else None
     def profile(self, player):
         return self.db.execute('SELECT player_id AS id,display_name AS name FROM eden_social.profiles WHERE player_id=%s', (player,)).fetchone()
+    def profiles(self, players):
+        ids=list(set(players))
+        if not ids:return {}
+        rows=self.db.execute('SELECT player_id AS id,display_name AS name FROM eden_social.profiles WHERE player_id=ANY(%s::text[])',(ids,))
+        return {row['id']:dict(row) for row in rows}
+    def relations(self, player):
+        rows=self.db.execute('SELECT player_a,player_b,status,requested_by FROM eden_social.friendships WHERE player_a=%s OR player_b=%s',(player,player))
+        friends=[];requests=[]
+        for row in rows:
+            if row['status']=='accepted':friends.append(row['player_b'] if row['player_a']==player else row['player_a'])
+            elif row['status']=='pending':requests.append(dict(a=row['requested_by'],b=row['player_b'] if row['requested_by']==row['player_a'] else row['player_a']))
+        return friends,requests
     def register(self, player, name, digest):
         self.db.execute('INSERT INTO eden_social.profiles(player_id,display_name,credential_hash) VALUES(%s,%s,%s)', (player, name, digest))
     def friends(self, player):
@@ -134,11 +171,11 @@ class PostgresStorage:
 
     def load_parties(self):
         parties = {}
-        for row in self.db.execute('SELECT party_id,leader_id FROM eden_social.parties ORDER BY created_at,party_id'):
-            key = row['party_id'].hex
-            parties[key] = dict(id=key, leader=row['leader_id'], members={})
-        for row in self.db.execute('SELECT party_id,player_id FROM eden_social.party_members ORDER BY joined_at,player_id'):
-            parties[row['party_id'].hex]['members'][row['player_id']] = False
+        rows=self.db.execute('SELECT p.party_id,p.leader_id,m.player_id FROM eden_social.parties p LEFT JOIN eden_social.party_members m ON m.party_id=p.party_id ORDER BY p.created_at,p.party_id,m.joined_at,m.player_id')
+        for row in rows:
+            key=row['party_id'].hex
+            party=parties.setdefault(key,dict(id=key,leader=row['leader_id'],members={}))
+            if row['player_id'] is not None:party['members'][row['player_id']]=False
         for party in parties.values():
             if not 1 <= len(party['members']) <= 4 or party['leader'] not in party['members']:
                 raise StorageUnavailable()

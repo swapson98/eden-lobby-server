@@ -86,7 +86,7 @@ class SocialStore:
         for r in reversed(list(self.reservations.values())):
             if party and r['party']==party['id'] and (actor in r['tickets'] or actor==r.get('resident')):
                 admission=dict(partyId=r['party'],reservation=r['id'],reservationId=r['id'],roomId=r['room'],endpoint=r['endpoint'],ticket=r['tickets'].get(actor,''),resident=actor==r.get('resident'),team=r['team'],state=r['state'],expiresIn=max(0,int(r['until']-time.monotonic())));break
-        return dict(self=view(actor),friends=friends,requests=requests,invitations=invitations,party=public,admission=admission)
+        return dict(self=view(actor),friends=friends,requests=requests,invitations=invitations,party=public,admission=admission,atomicPartyInvite=True,requestIds=True)
     def room_reservations(self,room):
         return [r for r in self.reservations.values() if r['room']==room and r['state'] in ('preparing','committed')]
     def reservation_ticket(self,room,ticket):
@@ -183,7 +183,9 @@ class SocialStore:
                     if party:self.fail(409,'Already in a party')
                     party=dict(id=secrets.token_hex(16),leader=actor,members={actor:False});self.parties[party['id']]=party
                 elif op=='party_invite':
-                    if not party or party['leader']!=actor:self.fail(403,'Only party leader can invite')
+                    if not party:
+                        party=dict(id=secrets.token_hex(16),leader=actor,members={actor:False});self.parties[party['id']]=party
+                    if party['leader']!=actor:self.fail(403,'Only party leader can invite')
                     if len(party['members'])>=4:self.fail(409,'Party full (4 players)')
                     if not self.storage.has_friend(pair):self.fail(403,'Invite an accepted friend')
                     if self.party_for(target):self.fail(409,'Player already in a party')

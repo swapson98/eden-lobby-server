@@ -69,6 +69,22 @@ class SocialTests(unittest.TestCase):
         self.assertIsNone(self.state(a)['admission'])
         self.assertEqual(self.call(a,'party_create')[0],200)
         self.assertIsNone(self.state(a)['admission'])
+    def test_authenticated_room_creation_retry_returns_same_room(self):
+        a,b=self.users[:2];data=dict(name='reliable room',public=False,map='BioLab',mode=0,endpoint='127.0.0.1:7777',requestId='a'*32)
+        create=lambda u,d:self.d.handle('POST','/v1/rooms',d,'Bearer '+u['token'] if u else '', 'test')
+        first=create(a,data);self.assertEqual(first[0],201)
+        self.assertEqual(create(a,data),first);self.assertEqual(len(self.d.rooms),1)
+        self.assertEqual(create(a,dict(data,name='changed'))[0],409)
+        self.assertEqual(create(None,data)[0],401)
+        other=create(b,data);self.assertEqual(other[0],201);self.assertNotEqual(other[1]['ownerToken'],first[1]['ownerToken'])
+    def test_first_invite_creates_party_atomically(self):
+        a,b,c=self.users[:3];self.friend(a,b)
+        self.assertEqual(self.call(a,'party_invite',target=b['id'],requestId='a'*32)[0],200)
+        self.assertEqual(self.state(a)['party']['leader'],a['id'])
+        self.assertEqual(self.call(a,'party_invite',target=b['id'],requestId='a'*32)[0],200)
+        self.assertEqual(len(self.state(b)['invitations']),1)
+        self.assertEqual(self.call(c,'party_invite',target=b['id'])[0],403)
+        self.assertIsNone(self.state(c)['party'])
     def test_party_capacity_leader_and_permissions(self):
         a=self.party(4);b=self.users[1];fifth=self.users[4]
         self.friend(a,fifth);self.assertEqual(self.call(a,'party_invite',target=fifth['id'])[0],409)

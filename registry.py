@@ -5,7 +5,7 @@ Room leases expire after 60s. All state is ephemeral; never log tokens/endpoints
 import os
 from social import SocialStore, SocialError
 from social_storage import PostgresStorage, StorageUnavailable
-import argparse, collections, hmac, http.server, ipaddress, json, re, secrets, ssl, threading, time
+import argparse, collections, hashlib, hmac, http.server, ipaddress, json, re, secrets, ssl, threading, time
 class Directory:
  def __init__(self,social_db=None):
   self.rooms={}; self.rates={}; self.lock=threading.Lock(); self.rate_lock=threading.Lock()
@@ -31,7 +31,6 @@ class Directory:
     return self.social.handle(method,path,data,auth,peer,self) if self.social else (503,{'error':'Social service persistence is not configured'})
    if method=='GET' and path=='/v1/rooms':return 200,{'rooms':[self.public(r) for r in self.rooms.values() if r['public']][:100]}
    if method=='POST' and path=='/v1/rooms':
-    if len(self.rooms)>=200:return 503,{'error':'Directory capacity reached'}
     endpoint=data.get('endpoint','')
     if not isinstance(endpoint,str):return 400,{'error':'Invalid endpoint'}
     host,sep,port=endpoint.rpartition(':')
@@ -51,8 +50,19 @@ class Directory:
      try:host_id=self.social.actor(auth)
      except SocialError:return 401,{'error':'Host device credential invalid'}
      except StorageUnavailable:return 503,{'error':'Social storage temporarily unavailable; retry later'}
+    request_id=data.get('requestId');request_hash=None
+    if request_id is not None:
+     if not self.social or not self.social.identifier(request_id):return 400,{'error':'Invalid request ID'}
+     if not host_id:return 401,{'error':'Device authentication required for request replay'}
+     request_hash=hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+     for previous in self.rooms.values():
+      if previous.get('hostId')==host_id and previous.get('requestId')==request_id:
+       if previous.get('requestHash')!=request_hash:return 409,{'error':'Request ID reused for another room'}
+       return 201,dict(id=previous['id'],ownerToken=previous['owner'],inviteCode=previous['code'])
+    if len(self.rooms)>=200:return 503,{'error':'Directory capacity reached'}
     r=dict(id=secrets.token_hex(16),name=name.strip(),public=data['public'],map=data['map'],mode=data['mode'],players=1,endpoint=endpoint,owner=secrets.token_hex(32),code=secrets.token_hex(16),expiry=now+60,tickets={})
     if host_id:r['hostId']=host_id
+    if request_id is not None:r.update(requestId=request_id,requestHash=request_hash)
     self.rooms[r['id']]=r;return 201,dict(id=r['id'],ownerToken=r['owner'],inviteCode=r['code'])
    if method=='POST' and path=='/v1/join':
     r=None;code=data.get('code','');rid=data.get('roomId','')

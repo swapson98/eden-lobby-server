@@ -60,6 +60,15 @@ class SocialTests(unittest.TestCase):
         # A request ID is not an authorization capability for another player.
         self.assertEqual(self.call(b,'party_invite',target=a['id'],requestId='b'*32)[0],403)
         self.assertEqual(self.call(a,'party_leave',requestId='not-a-request-id')[0],400)
+        self.assertEqual(self.d.handle('POST','/v1/social/action',dict(op='party_create',requestId='d'*32),'Bearer '+'0'*64,'test')[0],401)
+    def test_old_party_admission_does_not_follow_new_party(self):
+        a=self.party(2);party=self.state(a)['party']['id']
+        self.d.social.reservations['d'*32]=dict(id='d'*32,party=party,room='e'*32,endpoint='127.0.0.1:7777',tickets={a['id']:'f'*64},resident=None,team=0,state='accepted',until=time.monotonic()+30)
+        self.assertEqual(self.state(a)['admission']['partyId'],party)
+        self.assertEqual(self.call(a,'party_disband')[0],200)
+        self.assertIsNone(self.state(a)['admission'])
+        self.assertEqual(self.call(a,'party_create')[0],200)
+        self.assertIsNone(self.state(a)['admission'])
     def test_party_capacity_leader_and_permissions(self):
         a=self.party(4);b=self.users[1];fifth=self.users[4]
         self.friend(a,fifth);self.assertEqual(self.call(a,'party_invite',target=fifth['id'])[0],409)

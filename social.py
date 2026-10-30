@@ -84,8 +84,8 @@ class SocialStore:
         public=None if not party else dict(id=party['id'],leader=party['leader'],members=[dict(**view(m),ready=ready) for m,ready in party['members'].items()])
         admission=None
         for r in reversed(list(self.reservations.values())):
-            if actor in r['tickets'] or actor==r.get('resident'):
-                admission=dict(reservation=r['id'],reservationId=r['id'],roomId=r['room'],endpoint=r['endpoint'],ticket=r['tickets'].get(actor,''),resident=actor==r.get('resident'),team=r['team'],state=r['state'],expiresIn=max(0,int(r['until']-time.monotonic())));break
+            if party and r['party']==party['id'] and (actor in r['tickets'] or actor==r.get('resident')):
+                admission=dict(partyId=r['party'],reservation=r['id'],reservationId=r['id'],roomId=r['room'],endpoint=r['endpoint'],ticket=r['tickets'].get(actor,''),resident=actor==r.get('resident'),team=r['team'],state=r['state'],expiresIn=max(0,int(r['until']-time.monotonic())));break
         return dict(self=view(actor),friends=friends,requests=requests,invitations=invitations,party=public,admission=admission)
     def room_reservations(self,room):
         return [r for r in self.reservations.values() if r['room']==room and r['state'] in ('preparing','committed')]
@@ -122,8 +122,8 @@ class SocialStore:
                         previous=self.operation_ids.get(identity)
                         if previous:
                             if previous[0]!=fingerprint:return 409,dict(error='Request ID reused for another operation')
-                            result=200,self.snapshot(actor);result[1]['replayed']=True;replayed=True
-                    if not replayed:result=self._handle(method,path,data,auth,peer,directory)
+                            self.prune();result=200,self.snapshot(actor);result[1]['replayed']=True;replayed=True
+                    if not replayed:result=self._handle(method,path,data,auth,peer,directory,identity[0] if identity else None)
                     if result[0]>=400:raise Rejected()
                     if self.storage.persistent_parties:self.storage.save_parties(before,self.parties)
                 if identity and result[0]<400:
@@ -132,12 +132,13 @@ class SocialStore:
                     result[1]['requestId']=request_id
                 result[1]['processingMs']=round((time.monotonic()-started)*1000,2)
                 return result
-            except (Rejected,StorageUnavailable) as error:
+            except (Rejected,StorageUnavailable,SocialError) as error:
                 self.parties,self.invites,self.reservations,self.presence,self.rates,self.restored_until=saved
                 if isinstance(error,Rejected):return result
+                if isinstance(error,SocialError):return error.status,dict(error=error.message)
                 return 503,dict(error='Social storage temporarily unavailable; retry later')
 
-    def _handle(self,method,path,data,auth,peer,directory):
+    def _handle(self,method,path,data,auth,peer,directory,authenticated_actor=None):
         with self.lock:
             try:
                 self.prune();now=time.monotonic()
@@ -150,7 +151,7 @@ class SocialStore:
                     self.storage.register(player,name.strip(),self.digest(token))
                     rate.append(now);self.presence[player]=('online',now)
                     return 201,dict(id=player,name=name.strip(),token=token)
-                actor=self.actor(auth)
+                actor=authenticated_actor or self.actor(auth)
                 previous=self.presence.get(actor,('online',now))[0];self.presence[actor]=(previous if previous!='offline' else 'online',now)
                 if method=='GET' and path=='/v1/social/state':return 200,self.snapshot(actor)
                 if method=='POST' and path=='/v1/social/presence':

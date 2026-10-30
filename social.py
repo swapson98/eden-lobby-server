@@ -14,7 +14,7 @@ class SocialStore:
         self.db=getattr(self.storage,'db',None)  # legacy SQLite test inspection
         self.lock=threading.RLock()
         self.parties={};self.invites={};self.reservations={};self.presence={};self.rates={}
-        self.restored_until={}
+        self.restored_until={};self.operation_ids={}
     def close(self):self.storage.close()
     @staticmethod
     def digest(token):return hashlib.sha256(token.encode()).hexdigest()
@@ -96,6 +96,7 @@ class SocialStore:
                 if hmac.compare_digest(t,ticket):return r,player
         return None,None
     def handle(self,method,path,data,auth,peer,directory):
+        started=time.monotonic()
         # Roll back both durable writes and transient admissions on failed operations.
         class Rejected(Exception):pass
         with self.lock:
@@ -111,9 +112,25 @@ class SocialStore:
                                 party['members']={m:old['members'].get(m,False) for m in party['members']}
                             if key not in self.restored_until:self.restored_until[key]=time.monotonic()+35
                         self.parties=copy.deepcopy(before)
-                    result=self._handle(method,path,data,auth,peer,directory)
+                    request_id=data.get('requestId') if method=='POST' and path=='/v1/social/action' else None
+                    identity=None;fingerprint=None;replayed=False
+                    if request_id is not None:
+                        if not self.identifier(request_id):return 400,dict(error='Invalid request ID')
+                        actor=self.actor(auth);identity=(actor,request_id)
+                        fingerprint=hashlib.sha256(json.dumps(data,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+                        now=time.monotonic();self.operation_ids={k:v for k,v in self.operation_ids.items() if v[1]>now}
+                        previous=self.operation_ids.get(identity)
+                        if previous:
+                            if previous[0]!=fingerprint:return 409,dict(error='Request ID reused for another operation')
+                            result=200,self.snapshot(actor);result[1]['replayed']=True;replayed=True
+                    if not replayed:result=self._handle(method,path,data,auth,peer,directory)
                     if result[0]>=400:raise Rejected()
                     if self.storage.persistent_parties:self.storage.save_parties(before,self.parties)
+                if identity and result[0]<400:
+                    if len(self.operation_ids)>=4096:self.operation_ids.pop(next(iter(self.operation_ids)))
+                    self.operation_ids[identity]=(fingerprint,time.monotonic()+120)
+                    result[1]['requestId']=request_id
+                result[1]['processingMs']=round((time.monotonic()-started)*1000,2)
                 return result
             except (Rejected,StorageUnavailable) as error:
                 self.parties,self.invites,self.reservations,self.presence,self.rates,self.restored_until=saved
